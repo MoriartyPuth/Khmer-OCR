@@ -323,3 +323,4 @@ This project is for educational and research purposes.
 - Khmer Unicode Standard — [unicode.org](https://unicode.org)
 - PyTorch CTC Loss — [pytorch.org](https://pytorch.org/docs/stable/generated/torch.nn.CTCLoss.html)
 - Streamlit — [streamlit.io](https://streamlit.io)
+- Contributor - [MariyaThorn](https://github.com/MariyaThorn)
