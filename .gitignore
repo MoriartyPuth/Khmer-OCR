@@ -18,6 +18,9 @@ env/
 # Model checkpoints (large files — use Git LFS or host separately)
 outputs/*.pth
 
+# Testing images
+testing_image/
+
 # Temp OCR files
 khmer_ocr_*.png
 khmer_ocr_*.jpg
