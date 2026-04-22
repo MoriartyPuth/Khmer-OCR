@@ -14,6 +14,32 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# ── Model auto-download ────────────────────────────────────────────────────────
+# Set this to your Hugging Face repo, e.g. "MoriartyPuth/khmer-ocr-model"
+HF_REPO_ID   = "MoriartyPuth/khmer-ocr-model"
+HF_FILENAME  = "best_model.pth"
+CHECKPOINT   = Path("outputs") / HF_FILENAME
+
+if not CHECKPOINT.exists():
+    CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from huggingface_hub import hf_hub_download
+        with st.spinner("Downloading model checkpoint from Hugging Face…"):
+            hf_hub_download(
+                repo_id=HF_REPO_ID,
+                filename=HF_FILENAME,
+                local_dir=str(CHECKPOINT.parent),
+            )
+        st.success("Model downloaded successfully.")
+    except Exception as e:
+        st.error(
+            f"Could not download model checkpoint.\n\n"
+            f"**Repo:** `{HF_REPO_ID}`\n\n"
+            f"**Error:** {e}\n\n"
+            "Make sure the Hugging Face repo exists and `best_model.pth` has been uploaded."
+        )
+        st.stop()
+
 from predict import load_model, predict_image, predict_document
 from improved_document_predict import predict_document_improved
 from utils.improved_line_segmentation import segment_document_improved
