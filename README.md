@@ -2,6 +2,8 @@
 
 A deep learning OCR system for recognising **Khmer (Cambodian) script** using a CNN + BiLSTM architecture trained with CTC loss. Includes a full Streamlit web GUI for single-line and full-document recognition.
 
+Live Demo : [Khmer OCR](https://khmer-ocr.streamlit.app/)
+
 ---
 
 ## 📊 Model Performance
@@ -298,17 +300,6 @@ Install all with:
 ```bash
 pip install -r requirements.txt
 ```
-
----
-
-## 🚀 Deploying to Streamlit Cloud
-
-1. Push this repo to GitHub
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub
-3. Click **Deploy an app** → select this repo → set `app.py` as the main file
-4. Host `best_model.pth` on [Hugging Face Hub](https://huggingface.co) or Google Drive and fetch it at startup
-
-> ⚠️ The model checkpoint is excluded from the repo (`.gitignore`). For deployment, host it externally and download it at runtime.
 
 ---
 
