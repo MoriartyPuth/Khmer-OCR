@@ -118,7 +118,7 @@ def main():
             save_detector(model, best_path, base=args.base,
                           epoch=epoch, val_dice=val_dice,
                           canvas_size=args.canvas_size)
-            marker = "  ← saved"
+            marker = "  <- saved"
 
         print(f"Epoch {epoch:3d}/{args.epochs} | "
               f"train {train_loss:.4f} | val {val_loss:.4f} | "
