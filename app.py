@@ -211,15 +211,59 @@ with st.sidebar:
     )
 
     st.subheader("Document settings")
-    threshold = st.slider("Binary threshold", 50, 200, 127, help="For line segmentation")
-    min_gap = st.slider("Min line gap (px)", 1, 20, 3)
+
+    threshold_mode = st.radio(
+        "Threshold mode",
+        ["Otsu (auto)", "Adaptive", "Fixed"],
+        index=0,
+        help=(
+            "Otsu: best for clean scans — picks threshold automatically.\n"
+            "Adaptive: best for phone photos with uneven lighting/shadows.\n"
+            "Fixed: manual value (use when auto modes struggle)."
+        ),
+    )
+    use_otsu     = threshold_mode == "Otsu (auto)"
+    use_adaptive = threshold_mode == "Adaptive"
+    threshold = st.slider(
+        "Fixed threshold value", 50, 200, 127,
+        help="Only used when mode is 'Fixed'",
+        disabled=(threshold_mode != "Fixed"),
+    )
+
+    use_clahe = st.checkbox(
+        "CLAHE contrast enhance", value=True,
+        help="Normalises local contrast before thresholding — helps faded/shadowed scans",
+    )
+    deskew_doc = st.checkbox(
+        "Deskew whole page first", value=True,
+        help="Correct page-level rotation before segmenting (recommended)",
+    )
+    adaptive_gap = st.checkbox(
+        "Adaptive line gap", value=True,
+        help="Derive gap threshold from the document itself instead of a fixed pixel count",
+    )
+
+    min_gap = st.slider("Min line gap (px)", 1, 20, 3,
+                        help="Used only when Adaptive line gap is off")
     min_height = st.slider("Min line height (px)", 1, 30, 5)
-    padding_tb = st.slider("Vertical padding (px)", 0, 30, 8, help="Extra pixels above/below each line (important for Khmer diacritics)")
+    padding_tb = st.slider("Vertical padding (px)", 0, 30, 8,
+                           help="Extra rows above/below each line — important for Khmer diacritics")
     padding_lr = st.slider("Horizontal padding (px)", 0, 20, 2)
-    use_deskew = st.checkbox("Deskew lines", value=True)
+    use_deskew = st.checkbox("Deskew lines (per-line)", value=True)
+    remove_borders = st.checkbox(
+        "Remove scanner borders", value=True,
+        help="Crop away thick dark borders from flatbed scanner output before processing",
+    )
     use_improved = st.checkbox("Improved mode (confidence scores)", value=True)
+    use_beam_search = st.checkbox(
+        "Beam search decoding", value=True,
+        help="CTC beam search (more accurate than greedy). Disable for faster preview.",
+    )
+    beam_width = st.slider("Beam width", 2, 20, 10,
+                           help="Wider beam = more accurate but slower",
+                           disabled=not use_beam_search)
     conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.6, step=0.05,
-                                help="Lines below this confidence will be flagged")
+                                help="Lines below this are flagged and retried with wider crop")
 
     st.divider()
     device_label = "cuda" if torch.cuda.is_available() else "cpu"
@@ -319,6 +363,14 @@ if run_btn:
                     confidence_threshold=conf_threshold,
                     verbose=False,
                     diagnostics=True,
+                    use_otsu=use_otsu,
+                    use_adaptive=use_adaptive,
+                    use_clahe=use_clahe,
+                    deskew_document_first=deskew_doc,
+                    adaptive_gap=adaptive_gap,
+                    remove_borders=remove_borders,
+                    use_beam_search=use_beam_search,
+                    beam_width=beam_width,
                 )
 
             st.subheader("Full document text")
@@ -342,15 +394,23 @@ if run_btn:
                     padding_left_right=padding_lr,
                     deskew=use_deskew,
                     return_metadata=True,
+                    use_otsu=use_otsu,
+                    use_adaptive=use_adaptive,
+                    use_clahe=use_clahe,
+                    deskew_document_first=deskew_doc,
+                    adaptive_gap=adaptive_gap,
+                    remove_borders=remove_borders,
                 )
 
             for i, (diag, line_text) in enumerate(zip(diagnostics, line_texts)):
-                conf = diag.get("confidence", 0.0)
-                status = diag.get("status", "ok")
+                conf       = diag.get("confidence", 0.0)
+                status     = diag.get("status", "ok")
+                retried    = diag.get("retried", False)
                 conf_color = "🟢" if conf >= conf_threshold else "🔴"
+                retry_badge = " ↺" if retried else ""
 
                 with st.expander(
-                    f"Line {i+1} — conf: {conf:.3f} {conf_color}  |  {line_text[:60]}{'…' if len(line_text) > 60 else ''}",
+                    f"Line {i+1} — conf: {conf:.3f} {conf_color}{retry_badge}  |  {line_text[:60]}{'…' if len(line_text) > 60 else ''}",
                     expanded=False,
                 ):
                     cols = st.columns([1, 2])
@@ -364,6 +424,8 @@ if run_btn:
                         st.markdown(f"**Text:** {line_text}")
                         st.markdown(f"**Confidence:** {conf:.4f}")
                         st.markdown(f"**Status:** {status}")
+                        if retried:
+                            st.caption("↺ Retried with wider crop — confidence improved")
 
         else:
             # Basic document prediction
