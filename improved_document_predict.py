@@ -22,6 +22,7 @@ from utils.vocab import NUM_CLASSES, ctc_decode, ctc_beam_search, IDX2CHAR, CHAR
 from data.dataset import get_transforms, resize_to_height
 from models.crnn import KhmerOCR
 from utils.improved_line_segmentation import segment_document_improved
+from models.line_detector import detect_lines
 
 
 # ── Load model ────────────────────────────────────────────────────────────────
@@ -103,6 +104,54 @@ def postprocess_ocr(text: str) -> str:
     return " ".join(text.split())
 
 
+# ── Neural segmentation (Model 2 — U-Net line detector) ──────────────────────
+
+def segment_document_neural(
+    img: Image.Image,
+    detector_model,
+    device: torch.device,
+    padding: int = 4,
+    input_size: int = 512,
+) -> Tuple[List[Image.Image], List[Tuple[int, int]], Dict]:
+    """
+    Detect-then-crop using the trained U-Net line detector.
+
+    Unlike the classical pipeline, boxes have real x-extents, so short
+    centred lines are cropped tightly (no huge white margins) — this
+    noticeably improves CRNN accuracy on certificate headings and dates.
+
+    Returns the same (line_images, line_bounds, metadata) shape as
+    segment_document_improved so the two paths are interchangeable.
+    """
+    boxes = detect_lines(detector_model, img, device, input_size=input_size)
+
+    gray = np.array(img.convert("RGB")).min(axis=2).astype(np.uint8)
+    h, w = gray.shape
+
+    line_images:  List[Image.Image]     = []
+    line_bounds:  List[Tuple[int, int]] = []
+    line_xranges: List[Tuple[int, int]] = []
+
+    for (x0, y0, x1, y1) in boxes:
+        y0p, y1p = max(0, y0 - padding), min(h, y1 + padding)
+        x0p, x1p = max(0, x0 - padding), min(w, x1 + padding)
+        if y1p - y0p < 2 or x1p - x0p < 2:
+            continue
+        line_images.append(Image.fromarray(gray[y0p:y1p, x0p:x1p]))
+        line_bounds.append((y0, y1))
+        line_xranges.append((x0p, x1p))
+
+    metadata: Dict = {
+        "num_lines":         len(line_images),
+        "image_size":        img.size,
+        "line_bounds":       line_bounds,
+        "line_xranges":      line_xranges,
+        "preprocessed_gray": gray,
+        "detector":          "unet",
+    }
+    return line_images, line_bounds, metadata
+
+
 # ── Document prediction ───────────────────────────────────────────────────────
 
 def predict_document_improved(
@@ -129,6 +178,9 @@ def predict_document_improved(
     confidence_threshold: float = 0.6,
     use_beam_search: bool = True,
     beam_width: int = 10,
+    # Neural line detector (Model 2) — optional
+    detector_model=None,
+    detector_input_size: int = 512,
     # I/O
     verbose: bool = True,
     diagnostics: bool = True,
@@ -140,6 +192,10 @@ def predict_document_improved(
         remove_borders       : Strip dark scanner borders before processing
         use_beam_search      : Use CTC beam search instead of greedy decoding
         beam_width           : Beam width for beam search (10 is a good default)
+        detector_model       : trained LineDetectorUNet — when given, line
+                               detection uses the neural detector (Model 2)
+                               and falls back to the classical pipeline only
+                               if the detector finds zero lines
 
     Low-confidence retry:
         Lines below `confidence_threshold` are automatically re-cropped with
@@ -162,29 +218,46 @@ def predict_document_improved(
     if verbose:
         print(f"[Document] {doc_img.size[0]}x{doc_img.size[1]}  mode={doc_img.mode}")
 
-    # Segmentation — always request metadata so we can retry from preprocessed_gray
-    try:
-        line_images, line_bounds, metadata = segment_document_improved(
-            doc_img,
-            threshold=threshold,
-            min_gap=min_gap,
-            min_height=min_height,
-            padding_top_bottom=padding_top_bottom,
-            padding_left_right=padding_left_right,
-            deskew=deskew,
-            return_metadata=True,
-            use_otsu=use_otsu,
-            use_adaptive=use_adaptive,
-            use_clahe=use_clahe,
-            deskew_document_first=deskew_document_first,
-            adaptive_gap=adaptive_gap,
-            remove_borders=remove_borders,
-            color_mode=color_mode,
-            mask_graphics=mask_graphics,
-        )
-    except Exception as e:
-        print(f"[Error] Segmentation failed: {e}")
-        return "", [], []
+    # Segmentation — neural detector first (when provided), classical otherwise.
+    # Always request metadata so we can retry from preprocessed_gray.
+    line_images, line_bounds, metadata = [], [], None
+
+    if detector_model is not None:
+        try:
+            line_images, line_bounds, metadata = segment_document_neural(
+                doc_img, detector_model, device,
+                padding=max(2, padding_top_bottom // 2),
+                input_size=detector_input_size,
+            )
+            if verbose and line_images:
+                print(f"[Detector] U-Net found {len(line_images)} lines")
+        except Exception as e:
+            print(f"[Warning] Neural detection failed ({e}) — falling back to classical")
+            line_images = []
+
+    if not line_images:
+        try:
+            line_images, line_bounds, metadata = segment_document_improved(
+                doc_img,
+                threshold=threshold,
+                min_gap=min_gap,
+                min_height=min_height,
+                padding_top_bottom=padding_top_bottom,
+                padding_left_right=padding_left_right,
+                deskew=deskew,
+                return_metadata=True,
+                use_otsu=use_otsu,
+                use_adaptive=use_adaptive,
+                use_clahe=use_clahe,
+                deskew_document_first=deskew_document_first,
+                adaptive_gap=adaptive_gap,
+                remove_borders=remove_borders,
+                color_mode=color_mode,
+                mask_graphics=mask_graphics,
+            )
+        except Exception as e:
+            print(f"[Error] Segmentation failed: {e}")
+            return "", [], []
 
     if not line_images:
         print("[Warning] No lines detected")
@@ -192,6 +265,9 @@ def predict_document_improved(
 
     preprocessed_gray: Optional[np.ndarray] = (metadata or {}).get("preprocessed_gray")
     gray_h = preprocessed_gray.shape[0] if preprocessed_gray is not None else 0
+    gray_w = preprocessed_gray.shape[1] if preprocessed_gray is not None else 0
+    # Neural detector provides x-extents per line; classical crops full width
+    line_xranges: Optional[List[Tuple[int, int]]] = (metadata or {}).get("line_xranges")
 
     if verbose:
         decoder = f"beam(w={beam_width})" if use_beam_search else "greedy"
@@ -217,7 +293,12 @@ def predict_document_improved(
                 wider = padding_top_bottom + 6
                 y0 = max(0, y0_raw - wider)
                 y1 = min(gray_h, y1_raw + wider + 1)
-                retry_np  = preprocessed_gray[y0:y1, :]
+                if line_xranges and i < len(line_xranges):
+                    x_lo = max(0, line_xranges[i][0] - 6)
+                    x_hi = min(gray_w, line_xranges[i][1] + 6)
+                else:
+                    x_lo, x_hi = 0, gray_w
+                retry_np  = preprocessed_gray[y0:y1, x_lo:x_hi]
                 retry_img = Image.fromarray(retry_np)
 
                 r_text, r_conf, r_confs = predict_line_with_confidence(

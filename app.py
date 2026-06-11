@@ -40,8 +40,23 @@ if not CHECKPOINT.exists():
         )
         st.stop()
 
+# ── Optional Model 2 — neural line detector (non-fatal if missing) ────────────
+DETECTOR_FILENAME = "line_detector.pth"
+DETECTOR_PATH     = Path("outputs") / DETECTOR_FILENAME
+
+if not DETECTOR_PATH.exists():
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=DETECTOR_FILENAME,
+            local_dir=str(DETECTOR_PATH.parent),
+        )
+    except Exception:
+        pass  # detector is optional — app falls back to classical segmentation
+
 from predict import load_model, predict_image, predict_document
-from improved_document_predict import predict_document_improved
+from improved_document_predict import predict_document_improved, segment_document_neural
 from utils.improved_line_segmentation import segment_document_improved
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -212,6 +227,27 @@ with st.sidebar:
 
     st.subheader("Document settings")
 
+    detector_available = DETECTOR_PATH.exists()
+    if detector_available:
+        line_det_label = st.radio(
+            "Line detection",
+            ["Neural detector (U-Net) — recommended", "Classical (heuristics)"],
+            index=0,
+            help=(
+                "Neural: trained U-Net finds text lines on ANY background — "
+                "certificates, forms, colored documents.\n"
+                "Classical: connected-component + projection heuristics."
+            ),
+        )
+        use_neural_detector = line_det_label.startswith("Neural")
+    else:
+        use_neural_detector = False
+        st.caption(
+            "ℹ️ Neural line detector not found — using classical segmentation. "
+            "Train one with `python train_detector.py --parquet <lines.parquet>` "
+            "and place `line_detector.pth` in `outputs/`."
+        )
+
     color_mode_label = st.radio(
         "Document type",
         ["Colored (certificate / form)", "Plain (scanned / black text)"],
@@ -299,7 +335,21 @@ def get_model(ckpt_path: str):
     return model, img_height, device, None
 
 
+@st.cache_resource(show_spinner="Loading line detector…")
+def get_detector(path: str):
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        from models.line_detector import load_detector
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return load_detector(str(p), dev)
+    except Exception:
+        return None
+
+
 model, img_height, device, load_err = get_model(checkpoint_path)
+detector = get_detector(str(DETECTOR_PATH)) if use_neural_detector else None
 
 if load_err:
     st.error(f"Checkpoint not found: `{load_err}`\nUpdate the path in the sidebar.")
@@ -391,6 +441,7 @@ if run_btn:
                     mask_graphics=mask_graphics,
                     use_beam_search=use_beam_search,
                     beam_width=beam_width,
+                    detector_model=detector,
                 )
 
             st.subheader("Full document text")
@@ -405,24 +456,30 @@ if run_btn:
             st.subheader(f"Line details — {len(line_texts)} lines detected")
             # Segment again to get crops for display
             with st.spinner("Generating line previews…"):
-                line_imgs, line_bounds, _ = segment_document_improved(
-                    pil_img,
-                    threshold=threshold,
-                    min_gap=min_gap,
-                    min_height=min_height,
-                    padding_top_bottom=padding_tb,
-                    padding_left_right=padding_lr,
-                    deskew=use_deskew,
-                    return_metadata=True,
-                    use_otsu=use_otsu,
-                    use_adaptive=use_adaptive,
-                    use_clahe=use_clahe,
-                    deskew_document_first=deskew_doc,
-                    adaptive_gap=adaptive_gap,
-                    remove_borders=remove_borders,
-                    color_mode=color_mode,
-                    mask_graphics=mask_graphics,
-                )
+                if detector is not None:
+                    line_imgs, line_bounds, _ = segment_document_neural(
+                        pil_img, detector, device,
+                        padding=max(2, padding_tb // 2),
+                    )
+                else:
+                    line_imgs, line_bounds, _ = segment_document_improved(
+                        pil_img,
+                        threshold=threshold,
+                        min_gap=min_gap,
+                        min_height=min_height,
+                        padding_top_bottom=padding_tb,
+                        padding_left_right=padding_lr,
+                        deskew=use_deskew,
+                        return_metadata=True,
+                        use_otsu=use_otsu,
+                        use_adaptive=use_adaptive,
+                        use_clahe=use_clahe,
+                        deskew_document_first=deskew_doc,
+                        adaptive_gap=adaptive_gap,
+                        remove_borders=remove_borders,
+                        color_mode=color_mode,
+                        mask_graphics=mask_graphics,
+                    )
 
             for i, (diag, line_text) in enumerate(zip(diagnostics, line_texts)):
                 conf       = diag.get("confidence", 0.0)
