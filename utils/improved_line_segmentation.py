@@ -204,39 +204,44 @@ def apply_binary_threshold(
 
 def mask_graphical_regions(binary: np.ndarray) -> np.ndarray:
     """
-    Remove logos, seals, and large decorative images from the binary image
-    before computing the horizontal projection.
+    Remove logos, seals, and decorative images from the binary image before
+    computing the horizontal projection.
 
-    Strategy:
-      1. Morphologically close with a large elliptical kernel to fill solid
-         graphical regions (logo ring, seal, etc.) into solid blobs.
-      2. Find connected components of the closed image.
-      3. Mask components that are:
-           - Large  (> 0.3% of image area) — rules out individual characters
-           - AND roughly square (aspect ratio < 5) — text LINES are very wide
-             (AR > 10 for typical lines); logos/seals have AR ≈ 1.
+    WHY NOT morphological 2D closing:
+        A 2D close kernel large enough to fill a logo (≥ 30 px) also bridges
+        the 20–40 px inter-line gaps of typical certificate text, merging all
+        text lines into one giant blob whose AR drops below the threshold —
+        the ENTIRE text gets masked and 0 lines are detected.
 
-    Kernel size scales with image — large images need a larger kernel so
-    the close operation bridges the gaps inside a 300-px logo correctly.
+    CORRECT APPROACH — horizontal-only dilation:
+        Dilation in the X direction only connects characters that are on the
+        SAME row (within the same text line) without bridging the VERTICAL
+        gaps between lines. After this dilation:
+          • A text line → one wide rectangle  (bw ≈ image width)
+          • A logo / seal → one compact blob   (bw ≈ logo diameter)
+
+        We keep only the wide text-line components; the compact graphic
+        components (where bw < 20% of image width AND aspect ratio < 2.5)
+        are masked out.
     """
     h, w = binary.shape
-    total_area = h * w
 
-    k = max(8, min(h, w) // 60)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    # Horizontal dilation: connects characters within a line, leaves vertical
+    # inter-line gaps intact.  Two iterations to bridge typical character spacing.
+    h_kw = max(15, w // 80)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (h_kw, 1))
+    dilated = cv2.dilate(binary, kernel, iterations=2)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
 
     mask = np.ones_like(binary, dtype=np.uint8)
     for i in range(1, num_labels):
         bx, by, bw, bh, area = stats[i, :5]
-        if area < total_area * 0.003:   # too small → not a graphic
-            continue
         if bw == 0 or bh == 0:
             continue
-        ar = max(bw, bh) / min(bw, bh)  # always ≥ 1
-        if ar < 5.0:                    # text lines have AR >> 5
+        # Text lines span most of the page width → bw / w is large
+        # Graphics (logos, seals) are compact → bw / w is small AND roughly square
+        if bw / w < 0.20 and bw / bh < 2.5:
             mask[by:by + bh, bx:bx + bw] = 0
 
     return (binary * mask).astype(np.uint8)
