@@ -6,19 +6,16 @@ Pipeline (in order):
       dark-colored text (orange, blue, navy) appear dark; solves colored certs
   0b. remove_scan_borders  — crop near-black flatbed scanner borders
   0c. crop_to_content_region — crop colored design borders (certificates, forms)
-       by finding where mean pixel brightness drops below a threshold;
-       THIS is the fix for "no lines detected" on colored-border documents —
-       without it the blue gradient creates projection > 0 on every row so
-       no gaps are ever found
   1.  CLAHE contrast enhancement
   2.  Document-level deskew
   3.  Binary threshold (Otsu / adaptive / fixed)
-  4.  mask_graphical_regions — blank out logos, seals, large decorative images
-       so they don't create false lines in the projection
-  5.  Morphological vertical dilation (joins Khmer diacritics to base row)
-      + Gaussian-smoothed horizontal projection
-  6.  Adaptive or fixed gap-based line detection
-  7.  Crop with padding + aspect-ratio filter + per-line deskew
+  4.  PRIMARY — segment_lines_by_components: connected-component text-line
+       grouping (what modern OCR engines including EasyOCR/PaddleOCR do).
+       Groups text blobs by vertical proximity — no reliance on "zero-ink rows"
+       so it works on certificates, forms, and any colored-background document.
+  4b. FALLBACK — horizontal projection gap detection (kept for plain scans
+       where CC might over-split sparse text).
+  5.  Crop with padding + aspect-ratio filter + per-line deskew
 """
 
 import cv2
@@ -247,6 +244,109 @@ def mask_graphical_regions(binary: np.ndarray) -> np.ndarray:
     return (binary * mask).astype(np.uint8)
 
 
+# ── Step 4b — CC-based text-line grouping (PRIMARY detector) ─────────────────
+
+def segment_lines_by_components(
+    binary: np.ndarray,
+    min_char_area: int = 100,
+    min_line_width_frac: float = 0.03,
+    min_line_ar: float = 2.5,
+) -> List[Tuple[int, int]]:
+    """
+    Detect text-line bounding boxes using connected-component grouping.
+
+    This is what modern OCR engines (EasyOCR, PaddleOCR, Tesseract) do at their
+    core: find character blobs, group nearby ones into text lines, return the
+    bounding box of each group as a line crop.
+
+    Unlike horizontal-projection gap detection this does NOT require rows of
+    zero ink between lines, so it works correctly on certificates, coloured
+    forms, and any document whose background prevents clean zero-projection gaps.
+
+    Algorithm:
+      1. Small vertical dilation (1×5) to connect Khmer diacritics to their
+         base consonants without bridging the much-larger inter-line gaps.
+      2. Find all connected components.
+      3. Discard noise (area < min_char_area).
+      4. Sort remaining components by vertical centre.
+      5. Greedily merge into line groups: a component joins the current group
+         when its Y-range overlaps or is within (30% of group's median height)
+         pixels of the group's current Y extent.
+      6. Discard groups that are:
+           • narrower than min_line_width_frac × image width  (isolated dots)
+           • have group_width / group_height < min_line_ar    (logos, seals)
+      7. Merge any overlapping group bounds and return sorted (y0, y1) list.
+
+    min_line_ar=2.5 filters compact graphics naturally — a logo/seal is
+    roughly square (AR ≈ 1) while even the shortest centred text heading
+    has AR > 3 at typical certificate resolution.
+    """
+    h, w = binary.shape
+
+    # Thin vertical dilation: joins stacked Khmer diacritics to base glyph
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    dilated  = cv2.dilate(binary, v_kernel, iterations=1)
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+
+    comps = []
+    for i in range(1, num_labels):
+        bx, by, bw, bh, area = stats[i, :5]
+        if area < min_char_area:
+            continue
+        comps.append((bx, by, bw, bh))
+
+    if not comps:
+        return []
+
+    comps.sort(key=lambda c: c[1] + c[3] / 2)   # sort by vertical centre
+
+    # Adaptive merge distance: 30% of the median component height so it
+    # bridges within-line diacritic gaps but not the larger inter-line gaps
+    median_h = float(np.median([c[3] for c in comps]))
+    merge_px = max(6, int(median_h * 0.30))
+
+    groups: List[List] = [[comps[0]]]
+    for comp in comps[1:]:
+        bx, by, bw, bh = comp
+        last = groups[-1]
+        g_y0 = min(c[1]        for c in last)
+        g_y1 = max(c[1] + c[3] for c in last)
+        if by <= g_y1 + merge_px and (by + bh) >= g_y0 - merge_px:
+            last.append(comp)
+        else:
+            groups.append([comp])
+
+    bounds = []
+    for grp in groups:
+        lx0 = min(c[0]        for c in grp)
+        lx1 = max(c[0] + c[2] for c in grp)
+        ly0 = min(c[1]        for c in grp)
+        ly1 = max(c[1] + c[3] for c in grp)
+
+        grp_w = lx1 - lx0
+        grp_h = max(ly1 - ly0, 1)
+
+        if grp_w / w < min_line_width_frac:
+            continue          # too narrow — isolated punctuation / decorative dot
+        if grp_w / grp_h < min_line_ar:
+            continue          # roughly square — logo, seal, watermark
+
+        bounds.append((ly0, ly1))
+
+    bounds.sort(key=lambda b: b[0])
+
+    # Merge any overlapping bounds (edge case after the grouping above)
+    merged: List[List[int]] = []
+    for y0, y1 in bounds:
+        if merged and y0 <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], y1)
+        else:
+            merged.append([y0, y1])
+
+    return [(y0, y1) for y0, y1 in merged]
+
+
 # ── Step 5 — Horizontal projection (dilation + smoothing) ────────────────────
 
 def compute_horizontal_projection(
@@ -416,18 +516,20 @@ def segment_document_improved(
         gray, threshold=threshold, use_otsu=use_otsu, use_adaptive=use_adaptive,
     )
 
-    # 4. Mask graphical regions (logos, seals, decorative images)
-    if mask_graphics:
-        binary = mask_graphical_regions(binary)
+    # 4. PRIMARY — connected-component text-line grouping
+    #    Works on ANY background (colored certs, forms, uneven lighting)
+    #    because it doesn't require zero-projection rows between lines.
+    line_bounds = segment_lines_by_components(binary)
 
-    # 5. Projection
-    projection = compute_horizontal_projection(binary, dilate_for_khmer=True, smooth=True)
-
-    # 6. Line detection
-    if adaptive_gap:
-        line_bounds = detect_line_boundaries_adaptive(projection, min_height=min_height)
-    else:
-        line_bounds = detect_line_boundaries(projection, min_gap=min_gap, min_height=min_height)
+    # 4b. FALLBACK — horizontal projection (for plain scans with very sparse text
+    #     where CC grouping may over-fragment into many tiny groups)
+    if not line_bounds:
+        binary_proj = mask_graphical_regions(binary) if mask_graphics else binary
+        projection  = compute_horizontal_projection(binary_proj, dilate_for_khmer=True, smooth=True)
+        if adaptive_gap:
+            line_bounds = detect_line_boundaries_adaptive(projection, min_height=min_height)
+        else:
+            line_bounds = detect_line_boundaries(projection, min_gap=min_gap, min_height=min_height)
 
     if not line_bounds:
         empty_meta = {"error": "No lines detected"} if return_metadata else None
