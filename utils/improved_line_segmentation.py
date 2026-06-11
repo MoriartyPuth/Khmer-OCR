@@ -250,7 +250,7 @@ def segment_lines_by_components(
     binary: np.ndarray,
     min_char_area: int = 100,
     min_line_width_frac: float = 0.03,
-    min_line_ar: float = 2.5,
+    min_line_ar: float = 1.2,
 ) -> List[Tuple[int, int]]:
     """
     Detect text-line bounding boxes using connected-component grouping.
@@ -264,27 +264,29 @@ def segment_lines_by_components(
     forms, and any document whose background prevents clean zero-projection gaps.
 
     Algorithm:
-      1. Small vertical dilation (1×5) to connect Khmer diacritics to their
-         base consonants without bridging the much-larger inter-line gaps.
-      2. Find all connected components.
-      3. Discard noise (area < min_char_area).
-      4. Sort remaining components by vertical centre.
-      5. Greedily merge into line groups: a component joins the current group
-         when its Y-range overlaps or is within (30% of group's median height)
-         pixels of the group's current Y extent.
-      6. Discard groups that are:
+      1. Vertical dilation (1×9) to connect Khmer diacritics AND subscript
+         consonants (coeng) to their base glyphs.  A ±4 px extension bridges
+         the 5–12 px gaps typical of Khmer coeng clusters while being too
+         small to bridge the ≥20 px gaps between separate text lines.
+      2. Find all connected components; skip noise (area < min_char_area).
+      3. Sort by vertical centre.
+      4. Greedily merge into line groups using merge_px = 12% of the median
+         component height.  12% is deliberately smaller than 30% (old value)
+         to stop inter-line merging at typical certificate line spacing.
+      5. Discard groups:
            • narrower than min_line_width_frac × image width  (isolated dots)
-           • have group_width / group_height < min_line_ar    (logos, seals)
-      7. Merge any overlapping group bounds and return sorted (y0, y1) list.
-
-    min_line_ar=2.5 filters compact graphics naturally — a logo/seal is
-    roughly square (AR ≈ 1) while even the shortest centred text heading
-    has AR > 3 at typical certificate resolution.
+           • group_width / group_height < min_line_ar          (logos, seals)
+         min_line_ar=1.2 means a true logo/seal (AR ≈ 1.0) is filtered while
+         even very short centred text (name, date) with AR ≈ 2–5 is kept.
+         The old value of 2.5 incorrectly filtered short centred lines.
+      6. Merge overlapping bounds; return sorted (y0, y1) list.
     """
     h, w = binary.shape
 
-    # Thin vertical dilation: joins stacked Khmer diacritics to base glyph
-    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    # Vertical dilation: (1×9) extends each component ±4 px up and down.
+    # Bridges Khmer coeng gaps (typically 5–12 px) without touching the
+    # ≥20 px gaps between separate lines.
+    v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 9))
     dilated  = cv2.dilate(binary, v_kernel, iterations=1)
 
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
@@ -301,10 +303,14 @@ def segment_lines_by_components(
 
     comps.sort(key=lambda c: c[1] + c[3] / 2)   # sort by vertical centre
 
-    # Adaptive merge distance: 30% of the median component height so it
-    # bridges within-line diacritic gaps but not the larger inter-line gaps
+    # merge_px = 12% of median component height.
+    # OLD value was 30% — too large: for 80px-tall components merge_px became
+    # 24 px, which bridged the typical 25 px certificate inter-line gaps and
+    # caused multiple lines to collapse into one "super-line" crop.
+    # At 12%, merge_px ≈ 10 px for 80px components — enough to join the
+    # remaining diacritic gaps after dilation, not enough to bridge lines.
     median_h = float(np.median([c[3] for c in comps]))
-    merge_px = max(6, int(median_h * 0.30))
+    merge_px = max(5, int(median_h * 0.12))
 
     groups: List[List] = [[comps[0]]]
     for comp in comps[1:]:
@@ -330,7 +336,7 @@ def segment_lines_by_components(
         if grp_w / w < min_line_width_frac:
             continue          # too narrow — isolated punctuation / decorative dot
         if grp_w / grp_h < min_line_ar:
-            continue          # roughly square — logo, seal, watermark
+            continue          # roughly square — logo, seal, watermark (AR ≈ 1)
 
         bounds.append((ly0, ly1))
 
