@@ -212,6 +212,24 @@ with st.sidebar:
 
     st.subheader("Document settings")
 
+    color_mode_label = st.radio(
+        "Document type",
+        ["Colored (certificate / form)", "Plain (scanned / black text)"],
+        index=0,
+        help=(
+            "Colored: uses the min(R,G,B) channel so orange, blue, and navy "
+            "text all appear dark — required for certificates and designed forms.\n"
+            "Plain: standard grayscale, best for black-ink scanned documents."
+        ),
+    )
+    color_mode = "min_channel" if color_mode_label.startswith("Colored") else "gray"
+
+    mask_graphics = st.checkbox(
+        "Mask graphics (logos / seals)", value=True,
+        help="Remove large non-text blobs (logos, official seals, decorative images) "
+             "before detecting lines.",
+    )
+
     threshold_mode = st.radio(
         "Threshold mode",
         ["Otsu (auto)", "Adaptive", "Fixed"],
@@ -369,6 +387,8 @@ if run_btn:
                     deskew_document_first=deskew_doc,
                     adaptive_gap=adaptive_gap,
                     remove_borders=remove_borders,
+                    color_mode=color_mode,
+                    mask_graphics=mask_graphics,
                     use_beam_search=use_beam_search,
                     beam_width=beam_width,
                 )
@@ -400,6 +420,8 @@ if run_btn:
                     deskew_document_first=deskew_doc,
                     adaptive_gap=adaptive_gap,
                     remove_borders=remove_borders,
+                    color_mode=color_mode,
+                    mask_graphics=mask_graphics,
                 )
 
             for i, (diag, line_text) in enumerate(zip(diagnostics, line_texts)):

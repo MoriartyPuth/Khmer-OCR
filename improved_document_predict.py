@@ -123,6 +123,8 @@ def predict_document_improved(
     deskew_document_first: bool = True,
     adaptive_gap: bool = True,
     remove_borders: bool = True,
+    color_mode: str = "min_channel",
+    mask_graphics: bool = True,
     # Prediction params
     confidence_threshold: float = 0.6,
     use_beam_search: bool = True,
@@ -177,6 +179,8 @@ def predict_document_improved(
             deskew_document_first=deskew_document_first,
             adaptive_gap=adaptive_gap,
             remove_borders=remove_borders,
+            color_mode=color_mode,
+            mask_graphics=mask_graphics,
         )
     except Exception as e:
         print(f"[Error] Segmentation failed: {e}")
