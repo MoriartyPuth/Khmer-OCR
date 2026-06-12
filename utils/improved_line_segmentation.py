@@ -9,12 +9,10 @@ Pipeline (in order):
   1.  CLAHE contrast enhancement
   2.  Document-level deskew
   3.  Binary threshold (Otsu / adaptive / fixed)
-  4.  PRIMARY — segment_lines_by_components: connected-component text-line
-       grouping (what modern OCR engines including EasyOCR/PaddleOCR do).
-       Groups text blobs by vertical proximity — no reliance on "zero-ink rows"
-       so it works on certificates, forms, and any colored-background document.
-  4b. FALLBACK — horizontal projection gap detection (kept for plain scans
-       where CC might over-split sparse text).
+  4.  PRIMARY — horizontal projection gap detection: fast and reliable for
+       plain documents where clear zero-ink rows separate text lines.
+  4b. FALLBACK — segment_lines_by_components: CC grouping used when projection
+       finds 0 lines (colored certificates, forms, gradient backgrounds).
   5.  Crop with padding + aspect-ratio filter + per-line deskew
 """
 
@@ -522,20 +520,22 @@ def segment_document_improved(
         gray, threshold=threshold, use_otsu=use_otsu, use_adaptive=use_adaptive,
     )
 
-    # 4. PRIMARY — connected-component text-line grouping
-    #    Works on ANY background (colored certs, forms, uneven lighting)
-    #    because it doesn't require zero-projection rows between lines.
-    line_bounds = segment_lines_by_components(binary)
+    # 4. PRIMARY — horizontal projection gap detection
+    #    Fast and reliable for plain documents (scans, typed pages) where
+    #    there are clear zero-ink rows between text lines.
+    binary_proj = mask_graphical_regions(binary) if mask_graphics else binary
+    projection  = compute_horizontal_projection(binary_proj, dilate_for_khmer=True, smooth=True)
+    if adaptive_gap:
+        line_bounds = detect_line_boundaries_adaptive(projection, min_height=min_height)
+    else:
+        line_bounds = detect_line_boundaries(projection, min_gap=min_gap, min_height=min_height)
 
-    # 4b. FALLBACK — horizontal projection (for plain scans with very sparse text
-    #     where CC grouping may over-fragment into many tiny groups)
+    # 4b. FALLBACK — connected-component grouping
+    #    Used when projection finds nothing (colored backgrounds, gradients, forms).
+    #    CC grouping doesn't require zero-ink rows so it handles certificates
+    #    where every row has ink from the background design.
     if not line_bounds:
-        binary_proj = mask_graphical_regions(binary) if mask_graphics else binary
-        projection  = compute_horizontal_projection(binary_proj, dilate_for_khmer=True, smooth=True)
-        if adaptive_gap:
-            line_bounds = detect_line_boundaries_adaptive(projection, min_height=min_height)
-        else:
-            line_bounds = detect_line_boundaries(projection, min_gap=min_gap, min_height=min_height)
+        line_bounds = segment_lines_by_components(binary)
 
     if not line_bounds:
         empty_meta = {"error": "No lines detected"} if return_metadata else None
