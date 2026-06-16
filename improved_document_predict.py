@@ -18,7 +18,8 @@ from typing import List, Tuple, Optional, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils.vocab import NUM_CLASSES, ctc_decode, ctc_beam_search, IDX2CHAR, CHAR2IDX
+from utils.vocab import NUM_CLASSES, ctc_decode, ctc_beam_search, ctc_beam_search_nbest, IDX2CHAR, CHAR2IDX
+from utils.khmer_lm import KhmerCharLM, rescore
 from data.dataset import get_transforms, resize_to_height
 from models.crnn import KhmerOCR
 from utils.improved_line_segmentation import segment_document_improved
@@ -44,6 +45,16 @@ def load_model(checkpoint_path: str, device: torch.device) -> Tuple[KhmerOCR, in
     return model, img_height
 
 
+def load_lm(path: str) -> Optional[KhmerCharLM]:
+    """Load the Khmer character LM if present; return None otherwise (optional)."""
+    try:
+        if os.path.exists(path):
+            return KhmerCharLM.load(path)
+    except Exception as e:
+        print(f"[Warning] Could not load LM ({e}) — continuing without re-ranking")
+    return None
+
+
 # ── Prediction with confidence ────────────────────────────────────────────────
 
 MIN_LINE_HEIGHT = 8  # px — lines shorter than this produce garbage when stretched to 32px
@@ -55,6 +66,8 @@ def predict_line_with_confidence(
     device: torch.device,
     use_beam_search: bool = True,
     beam_width: int = 10,
+    lm: Optional[KhmerCharLM] = None,
+    lm_alpha: float = 0.3,
 ) -> Tuple[str, float, List[float]]:
     """
     Predict text from a line image.
@@ -67,6 +80,12 @@ def predict_line_with_confidence(
     Decoding:
         use_beam_search=True  → ctc_beam_search (better accuracy, ~same speed at beam=10)
         use_beam_search=False → greedy argmax (faster, slightly less accurate)
+
+    Language-model re-ranking (lm given, lm_alpha > 0):
+        Beam search returns its top hypotheses; the character LM re-ranks them so
+        the most Khmer-like reading wins. This corrects look-alike glyph
+        confusions (្ត↔្ទ, ន↔ណ) and dropped characters that the visual model
+        alone gets wrong. Confidence stays the visual-model confidence.
     """
     # Thin-line guard — reject crops too short to contain real text
     if line_img.size[1] < MIN_LINE_HEIGHT:
@@ -90,7 +109,13 @@ def predict_line_with_confidence(
 
         if use_beam_search:
             lp_np = log_probs.squeeze(1).cpu().numpy()    # (T, C)
-            text  = ctc_beam_search(lp_np, beam_width=beam_width)
+            if lm is not None and lm_alpha > 0:
+                # Re-rank the n-best list with the language model
+                nbest = ctc_beam_search_nbest(lp_np, beam_width=beam_width,
+                                              nbest=beam_width)
+                text  = rescore(nbest, lm, alpha=lm_alpha)
+            else:
+                text  = ctc_beam_search(lp_np, beam_width=beam_width)
         else:
             indices = logits.argmax(dim=2).squeeze(1)
             text    = ctc_decode(indices.tolist())
@@ -120,6 +145,11 @@ def segment_document_neural(
     centred lines are cropped tightly (no huge white margins) — this
     noticeably improves CRNN accuracy on certificate headings and dates.
 
+    The U-Net mask tends to sit a few px inside the true glyph extent, which
+    clips the first/last character (especially trailing vowels and subscripts).
+    We widen each box horizontally by a fraction of its height to recover them;
+    horizontal slack only adds whitespace and never merges separate lines.
+
     Returns the same (line_images, line_bounds, metadata) shape as
     segment_document_improved so the two paths are interchangeable.
     """
@@ -133,8 +163,9 @@ def segment_document_neural(
     line_xranges: List[Tuple[int, int]] = []
 
     for (x0, y0, x1, y1) in boxes:
+        x_margin = padding + int(0.45 * (y1 - y0))   # recover clipped edge glyphs
         y0p, y1p = max(0, y0 - padding), min(h, y1 + padding)
-        x0p, x1p = max(0, x0 - padding), min(w, x1 + padding)
+        x0p, x1p = max(0, x0 - x_margin), min(w, x1 + x_margin)
         if y1p - y0p < 2 or x1p - x0p < 2:
             continue
         line_images.append(Image.fromarray(gray[y0p:y1p, x0p:x1p]))
@@ -178,6 +209,9 @@ def predict_document_improved(
     confidence_threshold: float = 0.6,
     use_beam_search: bool = True,
     beam_width: int = 10,
+    # Language model re-ranking (optional)
+    lm: Optional[KhmerCharLM] = None,
+    lm_alpha: float = 0.3,
     # Neural line detector (Model 2) — optional
     detector_model=None,
     detector_input_size: int = 512,
@@ -284,6 +318,7 @@ def predict_document_improved(
                 model, line_img, img_height, device,
                 use_beam_search=use_beam_search,
                 beam_width=beam_width,
+                lm=lm, lm_alpha=lm_alpha,
             )
             retried = False
 
@@ -305,6 +340,7 @@ def predict_document_improved(
                     model, retry_img, img_height, device,
                     use_beam_search=use_beam_search,
                     beam_width=beam_width,
+                    lm=lm, lm_alpha=lm_alpha,
                 )
                 r_text = postprocess_ocr(r_text)
 

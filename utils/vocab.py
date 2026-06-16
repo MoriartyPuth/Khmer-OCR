@@ -68,21 +68,21 @@ def _log_add(a: float, b: float) -> float:
     return max(a, b) + math.log1p(math.exp(-abs(a - b)))
 
 
-def ctc_beam_search(log_probs, beam_width: int = 10, blank: int = BLANK_TOKEN) -> str:
+def ctc_beam_search_nbest(
+    log_probs, beam_width: int = 10, nbest: int = 1, blank: int = BLANK_TOKEN,
+) -> list[tuple[str, float]]:
     """
-    CTC beam search decoder — pure Python, no extra dependencies.
+    CTC beam search returning the top-`nbest` hypotheses.
 
-    Explores `beam_width` candidate sequences simultaneously and returns the
-    one with the highest total probability. Significantly outperforms greedy
-    decoding on ambiguous Khmer clusters and short lines.
+    Returns a list of (text, total_log_prob) sorted best-first. The log prob is
+    the acoustic-model (visual) score only — useful for downstream language-model
+    rescoring, where the final score is am_logp + alpha * lm_logp.
 
     Args:
         log_probs  : (T, C) array of log-softmax probabilities
-        beam_width : number of beams to keep per timestep (10 is a good default)
+        beam_width : number of beams to keep per timestep
+        nbest      : how many hypotheses to return (<= beam_width)
         blank      : blank token index (0)
-
-    Returns:
-        Decoded text string
     """
     NEG_INF = float('-inf')
     T = len(log_probs)
@@ -139,6 +139,19 @@ def ctc_beam_search(log_probs, beam_width: int = 10, blank: int = BLANK_TOKEN) -
         )
 
     if not beams:
-        return ""
-    best = max(beams, key=lambda p: _log_add(beams[p][0], beams[p][1]))
-    return decode(list(best))
+        return [("", NEG_INF)]
+
+    ranked = sorted(
+        beams.items(),
+        key=lambda kv: _log_add(kv[1][0], kv[1][1]),
+        reverse=True,
+    )[:max(1, nbest)]
+    return [(decode(list(prefix)), _log_add(p[0], p[1])) for prefix, p in ranked]
+
+
+def ctc_beam_search(log_probs, beam_width: int = 10, blank: int = BLANK_TOKEN) -> str:
+    """
+    CTC beam search decoder — returns the single best decoded string.
+    Thin wrapper over ctc_beam_search_nbest for backward compatibility.
+    """
+    return ctc_beam_search_nbest(log_probs, beam_width=beam_width, nbest=1, blank=blank)[0][0]

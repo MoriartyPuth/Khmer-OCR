@@ -55,8 +55,24 @@ if not DETECTOR_PATH.exists():
     except Exception:
         pass  # detector is optional — app falls back to classical segmentation
 
+# ── Optional language model — char n-gram for hypothesis re-ranking ───────────
+# Shipped in the repo (small), with an HF fallback if missing.
+LM_FILENAME = "khmer_lm.pkl"
+LM_PATH     = Path("outputs") / LM_FILENAME
+
+if not LM_PATH.exists():
+    try:
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=LM_FILENAME,
+            local_dir=str(LM_PATH.parent),
+        )
+    except Exception:
+        pass  # LM is optional — OCR still runs without re-ranking
+
 from predict import load_model, predict_image, predict_document
-from improved_document_predict import predict_document_improved, segment_document_neural
+from improved_document_predict import predict_document_improved, segment_document_neural, load_lm
 from utils.improved_line_segmentation import segment_document_improved
 
 # ── Page config ────────────────────────────────────────────────────────────────
@@ -319,6 +335,19 @@ with st.sidebar:
     conf_threshold = st.slider("Confidence threshold", 0.0, 1.0, 0.6, step=0.05,
                                 help="Lines below this are flagged and retried with wider crop")
 
+    use_lm = st.checkbox(
+        "Language-model correction", value=True,
+        help="Re-rank beam-search hypotheses with a Khmer character language "
+             "model. Fixes look-alike glyph confusions (្ត↔្ទ, ន↔ណ) and some "
+             "dropped characters. Requires beam search.",
+    )
+    lm_alpha = st.slider(
+        "LM strength", 0.0, 1.0, 0.3, step=0.05,
+        help="How strongly the language model overrides the visual model. "
+             "0.3 is a safe default; higher can over-correct rare words.",
+        disabled=not use_lm,
+    )
+
     st.divider()
     device_label = "cuda" if torch.cuda.is_available() else "cpu"
     st.caption(f"Device: **{device_label}**")
@@ -348,8 +377,14 @@ def get_detector(path: str):
         return None
 
 
+@st.cache_resource(show_spinner="Loading language model…")
+def get_lm(path: str):
+    return load_lm(path)
+
+
 model, img_height, device, load_err = get_model(checkpoint_path)
 detector = get_detector(str(DETECTOR_PATH)) if use_neural_detector else None
+lm = get_lm(str(LM_PATH)) if use_lm else None
 
 if load_err:
     st.error(f"Checkpoint not found: `{load_err}`\nUpdate the path in the sidebar.")
@@ -442,6 +477,8 @@ if run_btn:
                     use_beam_search=use_beam_search,
                     beam_width=beam_width,
                     detector_model=detector,
+                    lm=lm,
+                    lm_alpha=lm_alpha,
                 )
 
             st.subheader("Full document text")
